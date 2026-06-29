@@ -10,15 +10,20 @@ app.use(express.json());
 
 const uri = process.env.MONGODB_URI;
 
+// 1. Instantiate the client globally so Vercel can cache the instance
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
     strict: true,
     deprecationErrors: true,
   },
+  // Serverless optimizations to gracefully recycle connections
+  maxPoolSize: 10,
+  minPoolSize: 0,
+  socketTimeoutMS: 30000,
 });
 
-// 1. Move database and collection definitions to the top scope
+// 2. Define db and collections globally so they are instantly accessible
 const db = client.db("taskbridge-db");
 const usersCollection = db.collection("users");
 const tasksCollection = db.collection("tasks");
@@ -26,12 +31,29 @@ const proposalsCollection = db.collection("proposals");
 const paymentsCollection = db.collection("payments");
 const reviewsCollection = db.collection("reviews");
 
-// 2. Keep the async initialization logic isolated just for DB setup
-async function initDatabase() {
+// 3. SERVERLESS CONNECTION GUARD MIDDLEWARE
+// This safely unfreezes and ensures a live connection pool on every request
+app.use(async (req, res, next) => {
+  if (req.path === "/") return next(); // Skip database check for the root route
+
+  try {
+    // If the connection is alive, this is a near-instant no-op.
+    // If Vercel just unfroze the container, this re-establishes the dead socket cleanly.
+    await client.connect();
+    next();
+  } catch (error) {
+    console.error("MongoDB Serverless Connection Guard Error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Database connection failed." });
+  }
+});
+
+// 4. One-time DB Setup (Runs quietly in the background without blocking routes)
+async function seedDatabase() {
   try {
     const existingCollections = await db.listCollections().toArray();
     const existingNames = existingCollections.map((col) => col.name);
-
     const requiredCollections = [
       "users",
       "tasks",
@@ -43,7 +65,6 @@ async function initDatabase() {
     for (const name of requiredCollections) {
       if (!existingNames.includes(name)) {
         await db.createCollection(name);
-        console.log(`Created collection: ${name}`);
       }
     }
 
@@ -53,12 +74,9 @@ async function initDatabase() {
     await proposalsCollection.createIndex({ task_id: 1 });
     await proposalsCollection.createIndex({ freelancer_email: 1 });
 
-    console.log("Indexes ensured.");
-
     const existingAdmin = await usersCollection.findOne({
       email: "admin1@taskhive.com",
     });
-
     if (!existingAdmin) {
       await usersCollection.insertOne({
         name: "Admin",
@@ -72,17 +90,15 @@ async function initDatabase() {
         isVerified: true,
         createdAt: new Date(),
       });
-      console.log("Admin account seeded.");
     }
-  } catch (error) {
-    console.error("Database initialization failed:", error);
+    console.log("Database structural check & seeding complete.");
+  } catch (err) {
+    console.error("Background DB Seed Error:", err);
   }
 }
+seedDatabase();
 
-// Run DB seeding/indexing in the background
-initDatabase();
-
-// 3. Shared aggregation pipeline pieces
+// --- Shared Freelancer Aggregation Pipeline ---
 const freelancerAggregationStages = [
   { $match: { role: "freelancer" } },
   {
@@ -146,9 +162,21 @@ const freelancerAggregationStages = [
   },
 ];
 
-// ---------------------------------------------
-// ROUTES (Now synchronously declared in outer scope)
-// ---------------------------------------------
+// --- ROUTES ---
+
+app.get("/api/users/freelancers", async (req, res) => {
+  try {
+    const freelancers = await usersCollection
+      .aggregate(freelancerAggregationStages)
+      .toArray();
+    res.status(200).json({ success: true, freelancers });
+  } catch (error) {
+    console.error("GET /api/users/freelancers error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch freelancers." });
+  }
+});
 
 app.get("/api/tasks", async (req, res) => {
   try {
@@ -204,144 +232,6 @@ app.get("/api/tasks", async (req, res) => {
   }
 });
 
-app.get("/api/tasks/latest", async (req, res) => {
-  try {
-    const tasks = await tasksCollection
-      .aggregate([
-        { $match: { status: "open" } },
-        { $sort: { createdAt: -1 } },
-        { $limit: 6 },
-        {
-          $lookup: {
-            from: "users",
-            localField: "client_email",
-            foreignField: "email",
-            as: "clientInfo",
-          },
-        },
-        {
-          $addFields: {
-            client_name: {
-              $ifNull: [
-                { $arrayElemAt: ["$clientInfo.name", 0] },
-                "Unknown Client",
-              ],
-            },
-          },
-        },
-        { $project: { clientInfo: 0 } },
-      ])
-      .toArray();
-    res.status(200).json({ success: true, tasks });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to fetch latest tasks." });
-  }
-});
-
-app.get("/api/tasks/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid task ID format." });
-    }
-    const result = await tasksCollection
-      .aggregate([
-        { $match: { _id: new ObjectId(id) } },
-        {
-          $lookup: {
-            from: "users",
-            localField: "client_email",
-            foreignField: "email",
-            as: "clientInfo",
-          },
-        },
-        {
-          $addFields: {
-            client_name: {
-              $ifNull: [
-                { $arrayElemAt: ["$clientInfo.name", 0] },
-                "Unknown Client",
-              ],
-            },
-          },
-        },
-        { $project: { clientInfo: 0 } },
-      ])
-      .toArray();
-
-    if (result.length === 0) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Task not found." });
-    }
-    res.status(200).json({ success: true, task: result[0] });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Failed to fetch task." });
-  }
-});
-
-app.get("/api/users/freelancers", async (req, res) => {
-  try {
-    const freelancers = await usersCollection
-      .aggregate(freelancerAggregationStages)
-      .toArray();
-    res.status(200).json({ success: true, freelancers });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to fetch freelancers." });
-  }
-});
-
-app.get("/api/users/freelancers/top", async (req, res) => {
-  try {
-    const freelancers = await usersCollection
-      .aggregate([
-        ...freelancerAggregationStages,
-        { $sort: { averageRating: -1, completedJobsCount: -1 } },
-        { $limit: 6 },
-      ])
-      .toArray();
-    res.status(200).json({ success: true, freelancers });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to fetch top freelancers." });
-  }
-});
-
-app.get("/api/users/freelancers/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid freelancer ID format." });
-    }
-    const result = await usersCollection
-      .aggregate([
-        { $match: { _id: new ObjectId(id) } },
-        ...freelancerAggregationStages,
-      ])
-      .toArray();
-
-    if (result.length === 0) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Freelancer not found." });
-    }
-    res.status(200).json({ success: true, freelancer: result[0] });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to fetch freelancer profile." });
-  }
-});
-
 app.get("/api/stats", async (req, res) => {
   try {
     const [totalTasks, totalUsers, payoutResult] = await Promise.all([
@@ -360,82 +250,10 @@ app.get("/api/stats", async (req, res) => {
       stats: { totalTasks, totalUsers, totalPayout },
     });
   } catch (error) {
+    console.error("GET /api/stats error:", error);
     res
       .status(500)
       .json({ success: false, message: "Failed to fetch platform stats." });
-  }
-});
-
-app.post("/api/proposals", async (req, res) => {
-  try {
-    const {
-      task_id,
-      freelancer_email,
-      proposed_budget,
-      estimated_days,
-      cover_note,
-    } = req.body;
-    if (
-      !task_id ||
-      !freelancer_email ||
-      !proposed_budget ||
-      !estimated_days ||
-      !cover_note
-    ) {
-      return res
-        .status(400)
-        .json({ success: false, message: "All fields are required." });
-    }
-    const existing = await proposalsCollection.findOne({
-      task_id,
-      freelancer_email,
-    });
-    if (existing) {
-      return res.status(409).json({
-        success: false,
-        message: "You have already submitted a proposal.",
-      });
-    }
-    const proposal = {
-      task_id,
-      freelancer_email,
-      proposed_budget: parseFloat(proposed_budget),
-      estimated_days: parseInt(estimated_days, 10),
-      cover_note,
-      status: "pending",
-      submitted_at: new Date(),
-    };
-    const result = await proposalsCollection.insertOne(proposal);
-    res.status(201).json({
-      success: true,
-      message: "Proposal submitted successfully.",
-      proposalId: result.insertedId,
-    });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to submit proposal." });
-  }
-});
-
-app.get("/api/proposals/check", async (req, res) => {
-  try {
-    const { task_id, freelancer_email } = req.query;
-    if (!task_id || !freelancer_email) {
-      return res.status(400).json({
-        success: false,
-        message: "task_id and freelancer_email are required.",
-      });
-    }
-    const existing = await proposalsCollection.findOne({
-      task_id,
-      freelancer_email,
-    });
-    res.status(200).json({ success: true, alreadyApplied: !!existing });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to check proposal status." });
   }
 });
 
