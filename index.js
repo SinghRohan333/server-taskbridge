@@ -274,6 +274,61 @@ app.get("/api/tasks/latest", async (req, res) => {
   }
 });
 
+// GET /api/tasks/client-stats — task counts by status + total spent
+app.get("/api/tasks/client-stats", async (req, res) => {
+  try {
+    const { client_email } = req.query;
+
+    if (!client_email) {
+      return res.status(400).json({
+        success: false,
+        message: "client_email is required.",
+      });
+    }
+
+    const [totalTasks, openTasks, inProgressTasks, spentResult] =
+      await Promise.all([
+        tasksCollection.countDocuments({ client_email }),
+        tasksCollection.countDocuments({ client_email, status: "open" }),
+        tasksCollection.countDocuments({
+          client_email,
+          status: "in-progress",
+        }),
+        paymentsCollection
+          .aggregate([
+            {
+              $match: {
+                client_email,
+                payment_status: "succeeded",
+              },
+            },
+            {
+              $group: { _id: null, total: { $sum: "$amount" } },
+            },
+          ])
+          .toArray(),
+      ]);
+
+    const totalSpent = spentResult.length > 0 ? spentResult[0].total : 0;
+
+    res.status(200).json({
+      success: true,
+      stats: {
+        totalTasks,
+        openTasks,
+        inProgressTasks,
+        totalSpent,
+      },
+    });
+  } catch (error) {
+    console.error("GET /api/tasks/client-stats error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch client stats.",
+    });
+  }
+});
+
 // GET /api/tasks/:id — single task, with client name joined
 app.get("/api/tasks/:id", async (req, res) => {
   try {
@@ -603,6 +658,72 @@ app.get("/api/reviews", async (req, res) => {
     });
   }
 });
+
+// POST /api/tasks — create a new task (client only, auth enforced on frontend)
+app.post("/api/tasks", async (req, res) => {
+  try {
+    const { title, category, description, budget, deadline, client_email } =
+      req.body;
+
+    // NOTE: client_email is trusted from the frontend session.
+    // Full JWT verification is deferred to Challenge 2 implementation.
+    if (
+      !title ||
+      !category ||
+      !description ||
+      !budget ||
+      !deadline ||
+      !client_email
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "All fields are required.",
+      });
+    }
+
+    if (typeof budget !== "number" || budget <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Budget must be a positive number.",
+      });
+    }
+
+    const deadlineDate = new Date(deadline);
+    if (isNaN(deadlineDate.getTime()) || deadlineDate <= new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: "Deadline must be a valid future date.",
+      });
+    }
+
+    const task = {
+      title: title.trim(),
+      category,
+      description: description.trim(),
+      budget,
+      deadline: deadlineDate,
+      client_email,
+      status: "open",
+      deliverable_url: "",
+      createdAt: new Date(),
+    };
+
+    const result = await tasksCollection.insertOne(task);
+
+    res.status(201).json({
+      success: true,
+      message: "Task posted successfully.",
+      taskId: result.insertedId,
+    });
+  } catch (error) {
+    console.error("POST /api/tasks error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to post task.",
+    });
+  }
+});
+
 // ---------------------------------------------
 // Root route (unchanged)
 // ---------------------------------------------
