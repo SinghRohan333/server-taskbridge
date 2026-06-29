@@ -173,22 +173,37 @@ async function run() {
         const skip = (pageNum - 1) * limitNum;
 
         const filter = { status: "open" };
-
-        if (search) {
-          filter.title = { $regex: search, $options: "i" };
-        }
-
-        if (category) {
-          filter.category = category;
-        }
+        if (search) filter.title = { $regex: search, $options: "i" };
+        if (category) filter.category = category;
 
         const totalCount = await tasksCollection.countDocuments(filter);
 
         const tasks = await tasksCollection
-          .find(filter)
-          .sort({ createdAt: -1 })
-          .skip(skip)
-          .limit(limitNum)
+          .aggregate([
+            { $match: filter },
+            { $sort: { createdAt: -1 } },
+            { $skip: skip },
+            { $limit: limitNum },
+            {
+              $lookup: {
+                from: "users",
+                localField: "client_email",
+                foreignField: "email",
+                as: "clientInfo",
+              },
+            },
+            {
+              $addFields: {
+                client_name: {
+                  $ifNull: [
+                    { $arrayElemAt: ["$clientInfo.name", 0] },
+                    "Unknown Client",
+                  ],
+                },
+              },
+            },
+            { $project: { clientInfo: 0 } },
+          ])
           .toArray();
 
         res.status(200).json({
@@ -201,10 +216,9 @@ async function run() {
         });
       } catch (error) {
         console.error("GET /api/tasks error:", error);
-        res.status(500).json({
-          success: false,
-          message: "Failed to fetch tasks.",
-        });
+        res
+          .status(500)
+          .json({ success: false, message: "Failed to fetch tasks." });
       }
     });
 
