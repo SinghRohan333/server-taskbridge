@@ -212,21 +212,38 @@ async function run() {
     app.get("/api/tasks/latest", async (req, res) => {
       try {
         const tasks = await tasksCollection
-          .find({ status: "open" })
-          .sort({ createdAt: -1 })
-          .limit(6)
+          .aggregate([
+            { $match: { status: "open" } },
+            { $sort: { createdAt: -1 } },
+            { $limit: 6 },
+            {
+              $lookup: {
+                from: "users",
+                localField: "client_email",
+                foreignField: "email",
+                as: "clientInfo",
+              },
+            },
+            {
+              $addFields: {
+                client_name: {
+                  $ifNull: [
+                    { $arrayElemAt: ["$clientInfo.name", 0] },
+                    "Unknown Client",
+                  ],
+                },
+              },
+            },
+            { $project: { clientInfo: 0 } },
+          ])
           .toArray();
 
-        res.status(200).json({
-          success: true,
-          tasks,
-        });
+        res.status(200).json({ success: true, tasks });
       } catch (error) {
         console.error("GET /api/tasks/latest error:", error);
-        res.status(500).json({
-          success: false,
-          message: "Failed to fetch latest tasks.",
-        });
+        res
+          .status(500)
+          .json({ success: false, message: "Failed to fetch latest tasks." });
       }
     });
 
