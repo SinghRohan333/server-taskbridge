@@ -549,6 +549,60 @@ app.get("/api/proposals/check", async (req, res) => {
     });
   }
 });
+
+// GET /api/reviews — all reviews for a freelancer, with reviewer name joined
+app.get("/api/reviews", async (req, res) => {
+  try {
+    const { reviewee_email } = req.query;
+
+    if (!reviewee_email) {
+      return res.status(400).json({
+        success: false,
+        message: "reviewee_email is required.",
+      });
+    }
+
+    const reviews = await reviewsCollection
+      .aggregate([
+        { $match: { reviewee_email } },
+        { $sort: { created_at: -1 } },
+        {
+          $lookup: {
+            from: "users",
+            localField: "reviewer_email",
+            foreignField: "email",
+            as: "reviewerInfo",
+          },
+        },
+        {
+          $addFields: {
+            reviewer_name: {
+              $ifNull: [
+                { $arrayElemAt: ["$reviewerInfo.name", 0] },
+                "Anonymous",
+              ],
+            },
+            reviewer_image: {
+              $ifNull: [{ $arrayElemAt: ["$reviewerInfo.image", 0] }, ""],
+            },
+          },
+        },
+        { $project: { reviewerInfo: 0 } },
+      ])
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      reviews,
+    });
+  } catch (error) {
+    console.error("GET /api/reviews error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch reviews.",
+    });
+  }
+});
 // ---------------------------------------------
 // Root route (unchanged)
 // ---------------------------------------------
