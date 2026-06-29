@@ -444,6 +444,98 @@ async function run() {
       }
     });
 
+    // POST /api/proposals — submit a proposal (freelancer only)
+    app.post("/api/proposals", async (req, res) => {
+      try {
+        const {
+          task_id,
+          freelancer_email,
+          proposed_budget,
+          estimated_days,
+          cover_note,
+        } = req.body;
+
+        if (
+          !task_id ||
+          !freelancer_email ||
+          !proposed_budget ||
+          !estimated_days ||
+          !cover_note
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: "All fields are required.",
+          });
+        }
+
+        // Check if this freelancer already applied to this task
+        const existing = await proposalsCollection.findOne({
+          task_id,
+          freelancer_email,
+        });
+
+        if (existing) {
+          return res.status(409).json({
+            success: false,
+            message: "You have already submitted a proposal for this task.",
+          });
+        }
+
+        const proposal = {
+          task_id,
+          freelancer_email,
+          proposed_budget: parseFloat(proposed_budget),
+          estimated_days: parseInt(estimated_days, 10),
+          cover_note,
+          status: "pending",
+          submitted_at: new Date(),
+        };
+
+        const result = await proposalsCollection.insertOne(proposal);
+
+        res.status(201).json({
+          success: true,
+          message: "Proposal submitted successfully.",
+          proposalId: result.insertedId,
+        });
+      } catch (error) {
+        console.error("POST /api/proposals error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to submit proposal.",
+        });
+      }
+    });
+
+    // GET /api/proposals/check — check if freelancer already applied to a task
+    app.get("/api/proposals/check", async (req, res) => {
+      try {
+        const { task_id, freelancer_email } = req.query;
+
+        if (!task_id || !freelancer_email) {
+          return res.status(400).json({
+            success: false,
+            message: "task_id and freelancer_email are required.",
+          });
+        }
+
+        const existing = await proposalsCollection.findOne({
+          task_id,
+          freelancer_email,
+        });
+
+        res.status(200).json({
+          success: true,
+          alreadyApplied: !!existing,
+        });
+      } catch (error) {
+        console.error("GET /api/proposals/check error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to check proposal status.",
+        });
+      }
+    });
     // ---------------------------------------------
     // Root route (unchanged)
     // ---------------------------------------------
