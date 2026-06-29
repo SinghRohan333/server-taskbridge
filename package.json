@@ -1,0 +1,19 @@
+{
+  "name": "taskbridge-server",
+  "version": "1.0.0",
+  "description": "Server side of Project Taskbridge",
+  "license": "ISC",
+  "author": "Rohan Singh",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js",
+    "server": "nodemon --env-file=.env index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "mongodb": "^7.4.0"
+  }
+}
