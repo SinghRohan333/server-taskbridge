@@ -77,23 +77,23 @@ async function seedDatabase() {
     await proposalsCollection.createIndex({ task_id: 1 });
     await proposalsCollection.createIndex({ freelancer_email: 1 });
 
-    const existingAdmin = await usersCollection.findOne({
-      email: "admin1@taskhive.com",
-    });
-    if (!existingAdmin) {
-      await usersCollection.insertOne({
-        name: "Admin",
-        email: "admin1@taskhive.com",
-        image: "",
-        role: "admin",
-        skills: [],
-        bio: "",
-        hourlyRate: 0,
-        isBlocked: false,
-        isVerified: true,
-        createdAt: new Date(),
-      });
-    }
+    // const existingAdmin = await usersCollection.findOne({
+    //   email: "admin1@taskhive.com",
+    // });
+    // if (!existingAdmin) {
+    //   await usersCollection.insertOne({
+    //     name: "Admin",
+    //     email: "admin1@taskhive.com",
+    //     image: "",
+    //     role: "admin",
+    //     skills: [],
+    //     bio: "",
+    //     hourlyRate: 0,
+    //     isBlocked: false,
+    //     isVerified: true,
+    //     createdAt: new Date(),
+    //   });
+    // }
     console.log("Database structural check & seeding complete.");
   } catch (err) {
     console.error("Background DB Seed Error:", err);
@@ -1691,6 +1691,281 @@ app.patch("/api/users/me", async (req, res) => {
     res
       .status(500)
       .json({ success: false, message: "Failed to update profile." });
+  }
+});
+
+// ---------------------------------------------
+// ADMIN ROLE GUARD
+// ---------------------------------------------
+// NOTE: same trust model as the rest of this API today (email passed by the
+// caller, looked up server-side). This is a stand-in until Challenge 2 wires
+// up real JWT verification across the whole app — at that point, swap this
+// out for a cookie/token check instead of trusting a passed-in email.
+function roleGuard(allowedRoles) {
+  return async (req, res, next) => {
+    const adminEmail = req.query.admin_email || req.body.admin_email;
+
+    if (!adminEmail) {
+      return res.status(401).json({
+        success: false,
+        message: "Missing admin_email — request is not authenticated.",
+      });
+    }
+
+    try {
+      const actingUser = await usersCollection.findOne({ email: adminEmail });
+
+      if (!actingUser) {
+        return res
+          .status(401)
+          .json({ success: false, message: "User not found." });
+      }
+
+      if (actingUser.isBlocked) {
+        return res
+          .status(403)
+          .json({ success: false, message: "Account suspended." });
+      }
+
+      if (!allowedRoles.includes(actingUser.role)) {
+        return res
+          .status(403)
+          .json({ success: false, message: "Forbidden — insufficient role." });
+      }
+
+      req.actingUser = actingUser;
+      next();
+    } catch (error) {
+      console.error("roleGuard error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Authorization check failed." });
+    }
+  };
+}
+
+// ---------------------------------------------
+// ADMIN ROUTES
+// ---------------------------------------------
+
+// GET /api/admin/stats
+app.get("/api/admin/stats", roleGuard(["admin"]), async (req, res) => {
+  try {
+    const [totalUsers, totalTasks, activeTasks, revenueResult] =
+      await Promise.all([
+        usersCollection.countDocuments({}),
+        tasksCollection.countDocuments({}),
+        tasksCollection.countDocuments({ status: { $ne: "completed" } }),
+        paymentsCollection
+          .aggregate([
+            { $match: { payment_status: "succeeded" } },
+            { $group: { _id: null, total: { $sum: "$amount" } } },
+          ])
+          .toArray(),
+      ]);
+
+    const totalRevenue = revenueResult.length > 0 ? revenueResult[0].total : 0;
+
+    res.status(200).json({
+      success: true,
+      stats: { totalUsers, totalTasks, totalRevenue, activeTasks },
+    });
+  } catch (error) {
+    console.error("GET /api/admin/stats error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch admin stats." });
+  }
+});
+
+// GET /api/admin/users
+app.get("/api/admin/users", roleGuard(["admin"]), async (req, res) => {
+  try {
+    const users = await usersCollection
+      .find({}, { projection: { password: 0 } })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({ success: true, users });
+  } catch (error) {
+    console.error("GET /api/admin/users error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch users." });
+  }
+});
+
+// PATCH /api/admin/users/:id/block
+app.patch(
+  "/api/admin/users/:id/block",
+  roleGuard(["admin"]),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid user ID." });
+      }
+
+      const targetUser = await usersCollection.findOne({
+        _id: new ObjectId(id),
+      });
+      if (!targetUser) {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found." });
+      }
+      if (targetUser.role === "admin") {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: "Admin accounts cannot be blocked.",
+          });
+      }
+
+      await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { isBlocked: true } },
+      );
+      res.status(200).json({ success: true, message: "User blocked." });
+    } catch (error) {
+      console.error("PATCH /api/admin/users/:id/block error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to block user." });
+    }
+  },
+);
+
+// PATCH /api/admin/users/:id/unblock
+app.patch(
+  "/api/admin/users/:id/unblock",
+  roleGuard(["admin"]),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid user ID." });
+      }
+
+      const result = await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { isBlocked: false } },
+      );
+      if (result.matchedCount === 0) {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found." });
+      }
+
+      res.status(200).json({ success: true, message: "User unblocked." });
+    } catch (error) {
+      console.error("PATCH /api/admin/users/:id/unblock error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to unblock user." });
+    }
+  },
+);
+
+// PATCH /api/admin/users/:id/verify
+app.patch(
+  "/api/admin/users/:id/verify",
+  roleGuard(["admin"]),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid user ID." });
+      }
+
+      const targetUser = await usersCollection.findOne({
+        _id: new ObjectId(id),
+      });
+      if (!targetUser) {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found." });
+      }
+      if (targetUser.role !== "freelancer") {
+        return res.status(400).json({
+          success: false,
+          message: "Only freelancer accounts can be verified.",
+        });
+      }
+
+      await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { isVerified: true } },
+      );
+      res.status(200).json({ success: true, message: "Freelancer verified." });
+    } catch (error) {
+      console.error("PATCH /api/admin/users/:id/verify error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to verify user." });
+    }
+  },
+);
+
+// GET /api/admin/tasks
+app.get("/api/admin/tasks", roleGuard(["admin"]), async (req, res) => {
+  try {
+    const tasks = await tasksCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.status(200).json({ success: true, tasks });
+  } catch (error) {
+    console.error("GET /api/admin/tasks error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch tasks." });
+  }
+});
+
+// DELETE /api/admin/tasks/:id
+app.delete("/api/admin/tasks/:id", roleGuard(["admin"]), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid task ID." });
+    }
+
+    const result = await tasksCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+    if (result.deletedCount === 0) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Task not found." });
+    }
+
+    res.status(200).json({ success: true, message: "Task deleted." });
+  } catch (error) {
+    console.error("DELETE /api/admin/tasks/:id error:", error);
+    res.status(500).json({ success: false, message: "Failed to delete task." });
+  }
+});
+
+// GET /api/admin/transactions
+app.get("/api/admin/transactions", roleGuard(["admin"]), async (req, res) => {
+  try {
+    const transactions = await paymentsCollection
+      .find({})
+      .sort({ paid_at: -1 })
+      .toArray();
+
+    res.status(200).json({ success: true, transactions });
+  } catch (error) {
+    console.error("GET /api/admin/transactions error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch transactions." });
   }
 });
 
