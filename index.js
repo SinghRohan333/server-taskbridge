@@ -382,6 +382,87 @@ app.get("/api/tasks/mine", async (req, res) => {
   }
 });
 
+// GET /api/tasks/active — in-progress tasks where freelancer has accepted proposal
+app.get("/api/tasks/active", async (req, res) => {
+  try {
+    const { freelancer_email } = req.query;
+
+    if (!freelancer_email) {
+      return res.status(400).json({
+        success: false,
+        message: "freelancer_email is required.",
+      });
+    }
+
+    const acceptedProposals = await proposalsCollection
+      .find({ freelancer_email, status: "accepted" })
+      .toArray();
+
+    if (acceptedProposals.length === 0) {
+      return res.status(200).json({ success: true, tasks: [] });
+    }
+
+    const taskIds = acceptedProposals
+      .map((p) => {
+        try {
+          return new ObjectId(p.task_id);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+    const tasks = await tasksCollection
+      .aggregate([
+        {
+          $match: {
+            _id: { $in: taskIds },
+            status: { $in: ["in-progress", "completed"] },
+          },
+        },
+        { $sort: { createdAt: -1 } },
+        {
+          $lookup: {
+            from: "users",
+            localField: "client_email",
+            foreignField: "email",
+            as: "clientInfo",
+          },
+        },
+        {
+          $addFields: {
+            client_name: {
+              $ifNull: [
+                { $arrayElemAt: ["$clientInfo.name", 0] },
+                "Unknown Client",
+              ],
+            },
+          },
+        },
+        { $project: { clientInfo: 0 } },
+      ])
+      .toArray();
+
+    // Attach proposal info (budget accepted, days) to each task
+    const proposalByTaskId = {};
+    for (const p of acceptedProposals) {
+      proposalByTaskId[p.task_id] = p;
+    }
+
+    const tasksWithProposal = tasks.map((task) => ({
+      ...task,
+      proposal: proposalByTaskId[task._id.toString()] || null,
+    }));
+
+    res.status(200).json({ success: true, tasks: tasksWithProposal });
+  } catch (error) {
+    console.error("GET /api/tasks/active error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch active tasks." });
+  }
+});
+
 // PATCH /api/tasks/:id — edit a task (only if status is open)
 app.patch("/api/tasks/:id", async (req, res) => {
   try {
@@ -1279,6 +1360,337 @@ app.get("/api/payments/client", async (req, res) => {
       success: false,
       message: "Failed to fetch payment history.",
     });
+  }
+});
+
+// GET /api/proposals/freelancer-stats — overview stats for freelancer dashboard
+app.get("/api/proposals/freelancer-stats", async (req, res) => {
+  try {
+    const { freelancer_email } = req.query;
+
+    if (!freelancer_email) {
+      return res.status(400).json({
+        success: false,
+        message: "freelancer_email is required.",
+      });
+    }
+
+    const [total, pending, accepted, rejected, earningsResult] =
+      await Promise.all([
+        proposalsCollection.countDocuments({ freelancer_email }),
+        proposalsCollection.countDocuments({
+          freelancer_email,
+          status: "pending",
+        }),
+        proposalsCollection.countDocuments({
+          freelancer_email,
+          status: "accepted",
+        }),
+        proposalsCollection.countDocuments({
+          freelancer_email,
+          status: "rejected",
+        }),
+        paymentsCollection
+          .aggregate([
+            { $match: { freelancer_email, payment_status: "succeeded" } },
+            { $group: { _id: null, total: { $sum: "$amount" } } },
+          ])
+          .toArray(),
+      ]);
+
+    const totalEarnings =
+      earningsResult.length > 0 ? earningsResult[0].total : 0;
+
+    res.status(200).json({
+      success: true,
+      stats: { total, pending, accepted, rejected, totalEarnings },
+    });
+  } catch (error) {
+    console.error("GET /api/proposals/freelancer-stats error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch stats." });
+  }
+});
+
+// GET /api/proposals/mine — all proposals for a freelancer with task title
+app.get("/api/proposals/mine", async (req, res) => {
+  try {
+    const { freelancer_email } = req.query;
+
+    if (!freelancer_email) {
+      return res.status(400).json({
+        success: false,
+        message: "freelancer_email is required.",
+      });
+    }
+
+    const proposals = await proposalsCollection
+      .aggregate([
+        { $match: { freelancer_email } },
+        { $sort: { submitted_at: -1 } },
+        {
+          $addFields: { taskObjectId: { $toObjectId: "$task_id" } },
+        },
+        {
+          $lookup: {
+            from: "tasks",
+            localField: "taskObjectId",
+            foreignField: "_id",
+            as: "taskInfo",
+          },
+        },
+        {
+          $addFields: {
+            task_title: {
+              $ifNull: [
+                { $arrayElemAt: ["$taskInfo.title", 0] },
+                "Deleted Task",
+              ],
+            },
+            task_category: {
+              $ifNull: [{ $arrayElemAt: ["$taskInfo.category", 0] }, "Other"],
+            },
+            task_status: {
+              $ifNull: [{ $arrayElemAt: ["$taskInfo.status", 0] }, "unknown"],
+            },
+          },
+        },
+        { $project: { taskInfo: 0, taskObjectId: 0 } },
+      ])
+      .toArray();
+
+    res.status(200).json({ success: true, proposals });
+  } catch (error) {
+    console.error("GET /api/proposals/mine error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch proposals." });
+  }
+});
+
+// PATCH /api/tasks/:id/complete — submit deliverable and mark task completed
+app.patch("/api/tasks/:id/complete", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { freelancer_email, deliverable_url } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid task ID." });
+    }
+
+    if (!deliverable_url || !deliverable_url.trim()) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Deliverable URL is required." });
+    }
+
+    // Verify this freelancer has an accepted proposal for this task
+    const proposal = await proposalsCollection.findOne({
+      task_id: id,
+      freelancer_email,
+      status: "accepted",
+    });
+
+    if (!proposal) {
+      return res.status(403).json({
+        success: false,
+        message: "You do not have permission to complete this task.",
+      });
+    }
+
+    await tasksCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: { status: "completed", deliverable_url: deliverable_url.trim() },
+      },
+    );
+
+    res
+      .status(200)
+      .json({ success: true, message: "Task marked as completed." });
+  } catch (error) {
+    console.error("PATCH /api/tasks/:id/complete error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to complete task." });
+  }
+});
+
+// GET /api/payments/freelancer — earnings history for a freelancer
+app.get("/api/payments/freelancer", async (req, res) => {
+  try {
+    const { freelancer_email } = req.query;
+
+    if (!freelancer_email) {
+      return res.status(400).json({
+        success: false,
+        message: "freelancer_email is required.",
+      });
+    }
+
+    const payments = await paymentsCollection
+      .aggregate([
+        { $match: { freelancer_email, payment_status: "succeeded" } },
+        { $sort: { paid_at: -1 } },
+        {
+          $lookup: {
+            from: "tasks",
+            let: { taskIdStr: "$task_id" },
+            pipeline: [
+              {
+                $match: {
+                  $expr: { $eq: [{ $toString: "$_id" }, "$$taskIdStr"] },
+                },
+              },
+            ],
+            as: "taskInfo",
+          },
+        },
+        {
+          $lookup: {
+            from: "users",
+            localField: "client_email",
+            foreignField: "email",
+            as: "clientInfo",
+          },
+        },
+        {
+          $addFields: {
+            task_title: {
+              $ifNull: [
+                { $arrayElemAt: ["$taskInfo.title", 0] },
+                "Deleted Task",
+              ],
+            },
+            task_id_obj: { $arrayElemAt: ["$taskInfo._id", 0] },
+            client_name: {
+              $ifNull: [
+                { $arrayElemAt: ["$clientInfo.name", 0] },
+                "Unknown Client",
+              ],
+            },
+          },
+        },
+        { $project: { taskInfo: 0, clientInfo: 0 } },
+      ])
+      .toArray();
+
+    res.status(200).json({ success: true, payments });
+  } catch (error) {
+    console.error("GET /api/payments/freelancer error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch earnings." });
+  }
+});
+
+// POST /api/reviews — submit a review after task completion
+app.post("/api/reviews", async (req, res) => {
+  try {
+    const { task_id, reviewer_email, reviewee_email, rating, comment } =
+      req.body;
+
+    if (!task_id || !reviewer_email || !reviewee_email || !rating) {
+      return res
+        .status(400)
+        .json({ success: false, message: "All fields are required." });
+    }
+
+    if (rating < 1 || rating > 5) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Rating must be between 1 and 5." });
+    }
+
+    const existing = await reviewsCollection.findOne({
+      task_id,
+      reviewer_email,
+    });
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: "You have already reviewed this task.",
+      });
+    }
+
+    await reviewsCollection.insertOne({
+      task_id,
+      reviewer_email,
+      reviewee_email,
+      rating: parseInt(rating, 10),
+      comment: comment?.trim() || "",
+      created_at: new Date(),
+    });
+
+    res
+      .status(201)
+      .json({ success: true, message: "Review submitted successfully." });
+  } catch (error) {
+    console.error("POST /api/reviews error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to submit review." });
+  }
+});
+
+// GET /api/reviews/check — check if freelancer already reviewed a task
+app.get("/api/reviews/check", async (req, res) => {
+  try {
+    const { task_id, reviewer_email } = req.query;
+
+    if (!task_id || !reviewer_email) {
+      return res.status(400).json({
+        success: false,
+        message: "task_id and reviewer_email are required.",
+      });
+    }
+
+    const existing = await reviewsCollection.findOne({
+      task_id,
+      reviewer_email,
+    });
+    res.status(200).json({ success: true, alreadyReviewed: !!existing });
+  } catch (error) {
+    console.error("GET /api/reviews/check error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to check review status." });
+  }
+});
+
+// PATCH /api/users/me — update freelancer profile
+app.patch("/api/users/me", async (req, res) => {
+  try {
+    const { email, name, image, skills, bio, hourlyRate } = req.body;
+
+    if (!email) {
+      return res
+        .status(400)
+        .json({ success: false, message: "email is required." });
+    }
+
+    const updateFields = {};
+    if (name !== undefined) updateFields.name = name.trim();
+    if (image !== undefined) updateFields.image = image.trim();
+    if (skills !== undefined) updateFields.skills = skills;
+    if (bio !== undefined) updateFields.bio = bio.trim();
+    if (hourlyRate !== undefined)
+      updateFields.hourlyRate = parseFloat(hourlyRate) || 0;
+
+    await usersCollection.updateOne({ email }, { $set: updateFields });
+
+    const updatedUser = await usersCollection.findOne(
+      { email },
+      { projection: { password: 0 } },
+    );
+
+    res.status(200).json({ success: true, user: updatedUser });
+  } catch (error) {
+    console.error("PATCH /api/users/me error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to update profile." });
   }
 });
 
