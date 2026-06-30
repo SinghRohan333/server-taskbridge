@@ -1,6 +1,9 @@
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const Stripe = require("stripe");
+
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 const port = process.env.PORT || 8000;
 const app = express();
@@ -325,6 +328,176 @@ app.get("/api/tasks/client-stats", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch client stats.",
+    });
+  }
+});
+
+// GET /api/tasks/mine — all tasks for a specific client
+app.get("/api/tasks/mine", async (req, res) => {
+  try {
+    const { client_email } = req.query;
+
+    if (!client_email) {
+      return res.status(400).json({
+        success: false,
+        message: "client_email is required.",
+      });
+    }
+
+    const tasks = await tasksCollection
+      .aggregate([
+        { $match: { client_email } },
+        { $sort: { createdAt: -1 } },
+        {
+          $lookup: {
+            from: "proposals",
+            let: { taskIdStr: { $toString: "$_id" } },
+            pipeline: [
+              {
+                $match: {
+                  $expr: { $eq: ["$task_id", "$$taskIdStr"] },
+                  status: "accepted",
+                },
+              },
+            ],
+            as: "acceptedProposals",
+          },
+        },
+        {
+          $addFields: {
+            hasAcceptedProposal: { $gt: [{ $size: "$acceptedProposals" }, 0] },
+          },
+        },
+        { $project: { acceptedProposals: 0 } },
+      ])
+      .toArray();
+
+    res.status(200).json({ success: true, tasks });
+  } catch (error) {
+    console.error("GET /api/tasks/mine error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch your tasks.",
+    });
+  }
+});
+
+// PATCH /api/tasks/:id — edit a task (only if status is open)
+app.patch("/api/tasks/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { client_email, title, category, description, budget, deadline } =
+      req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid task ID.",
+      });
+    }
+
+    const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!task) {
+      return res.status(404).json({
+        success: false,
+        message: "Task not found.",
+      });
+    }
+
+    if (task.client_email !== client_email) {
+      return res.status(403).json({
+        success: false,
+        message: "You do not have permission to edit this task.",
+      });
+    }
+
+    if (task.status !== "open") {
+      return res.status(403).json({
+        success: false,
+        message: "Only open tasks can be edited.",
+      });
+    }
+
+    await tasksCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          title: title.trim(),
+          category,
+          description: description.trim(),
+          budget: parseFloat(budget),
+          deadline,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Task updated successfully.",
+    });
+  } catch (error) {
+    console.error("PATCH /api/tasks/:id error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update task.",
+    });
+  }
+});
+
+// DELETE /api/tasks/:id — delete a task (only if no accepted proposal)
+app.delete("/api/tasks/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { client_email } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid task ID.",
+      });
+    }
+
+    const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!task) {
+      return res.status(404).json({
+        success: false,
+        message: "Task not found.",
+      });
+    }
+
+    if (task.client_email !== client_email) {
+      return res.status(403).json({
+        success: false,
+        message: "You do not have permission to delete this task.",
+      });
+    }
+
+    const acceptedProposal = await proposalsCollection.findOne({
+      task_id: id,
+      status: "accepted",
+    });
+
+    if (acceptedProposal) {
+      return res.status(400).json({
+        success: false,
+        message: "This task has an accepted proposal and cannot be deleted.",
+      });
+    }
+
+    await tasksCollection.deleteOne({ _id: new ObjectId(id) });
+
+    res.status(200).json({
+      success: true,
+      message: "Task deleted successfully.",
+    });
+  } catch (error) {
+    console.error("DELETE /api/tasks/:id error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete task.",
     });
   }
 });
@@ -720,6 +893,391 @@ app.post("/api/tasks", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to post task.",
+    });
+  }
+});
+
+// GET /api/proposals/client — all proposals grouped by task for a client
+app.get("/api/proposals/client", async (req, res) => {
+  try {
+    const { client_email } = req.query;
+
+    if (!client_email) {
+      return res.status(400).json({
+        success: false,
+        message: "client_email is required.",
+      });
+    }
+
+    // Get all tasks belonging to this client
+    const clientTasks = await tasksCollection.find({ client_email }).toArray();
+
+    if (clientTasks.length === 0) {
+      return res.status(200).json({ success: true, groups: [] });
+    }
+
+    const taskIds = clientTasks.map((t) => t._id.toString());
+
+    // Get all proposals for those tasks
+    const proposals = await proposalsCollection
+      .aggregate([
+        { $match: { task_id: { $in: taskIds } } },
+        { $sort: { submitted_at: -1 } },
+        {
+          $lookup: {
+            from: "users",
+            localField: "freelancer_email",
+            foreignField: "email",
+            as: "freelancerInfo",
+          },
+        },
+        {
+          $addFields: {
+            freelancer_name: {
+              $ifNull: [
+                { $arrayElemAt: ["$freelancerInfo.name", 0] },
+                "Unknown Freelancer",
+              ],
+            },
+            freelancer_image: {
+              $arrayElemAt: ["$freelancerInfo.image", 0],
+            },
+          },
+        },
+        { $project: { freelancerInfo: 0 } },
+      ])
+      .toArray();
+
+    // Group proposals by task_id
+    const proposalsByTaskId = {};
+    for (const proposal of proposals) {
+      if (!proposalsByTaskId[proposal.task_id]) {
+        proposalsByTaskId[proposal.task_id] = [];
+      }
+      proposalsByTaskId[proposal.task_id].push(proposal);
+    }
+
+    // Build groups — only tasks that have at least one proposal
+    const groups = clientTasks
+      .filter((task) => proposalsByTaskId[task._id.toString()]?.length > 0)
+      .map((task) => ({
+        task: {
+          _id: task._id.toString(),
+          title: task.title,
+          category: task.category,
+          budget: task.budget,
+          status: task.status,
+        },
+        proposals: proposalsByTaskId[task._id.toString()],
+      }));
+
+    res.status(200).json({ success: true, groups });
+  } catch (error) {
+    console.error("GET /api/proposals/client error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch proposals.",
+    });
+  }
+});
+
+// PATCH /api/proposals/:id/reject — reject a proposal
+app.patch("/api/proposals/:id/reject", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { client_email } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid proposal ID.",
+      });
+    }
+
+    const proposal = await proposalsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!proposal) {
+      return res.status(404).json({
+        success: false,
+        message: "Proposal not found.",
+      });
+    }
+
+    // Verify the client owns the task this proposal belongs to
+    const task = await tasksCollection.findOne({
+      _id: new ObjectId(proposal.task_id),
+      client_email,
+    });
+
+    if (!task) {
+      return res.status(403).json({
+        success: false,
+        message: "You do not have permission to reject this proposal.",
+      });
+    }
+
+    await proposalsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: "rejected" } },
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Proposal rejected.",
+    });
+  } catch (error) {
+    console.error("PATCH /api/proposals/:id/reject error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to reject proposal.",
+    });
+  }
+});
+
+// POST /api/stripe/create-checkout — create Stripe checkout session
+app.post("/api/stripe/create-checkout", async (req, res) => {
+  try {
+    const { proposal_id, task_id, client_email } = req.body;
+
+    if (!proposal_id || !task_id || !client_email) {
+      return res.status(400).json({
+        success: false,
+        message: "proposal_id, task_id, and client_email are required.",
+      });
+    }
+
+    const task = await tasksCollection.findOne({
+      _id: new ObjectId(task_id),
+      client_email,
+    });
+
+    if (!task) {
+      return res.status(404).json({
+        success: false,
+        message: "Task not found.",
+      });
+    }
+
+    const proposal = await proposalsCollection.findOne({
+      _id: new ObjectId(proposal_id),
+    });
+
+    if (!proposal) {
+      return res.status(404).json({
+        success: false,
+        message: "Proposal not found.",
+      });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      mode: "payment",
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: task.title,
+              description: `Freelancer proposal for: ${task.title}`,
+            },
+            unit_amount: Math.round(proposal.proposed_budget * 100),
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        proposal_id: proposal_id.toString(),
+        task_id: task_id.toString(),
+        client_email,
+        freelancer_email: proposal.freelancer_email,
+      },
+      success_url: `${process.env.FRONTEND_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}/dashboard/client/proposals`,
+    });
+
+    res.status(200).json({ success: true, url: session.url });
+  } catch (error) {
+    console.error("POST /api/stripe/create-checkout error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to create checkout session.",
+    });
+  }
+});
+
+// GET /api/stripe/confirm-session — confirm payment and update records
+app.get("/api/stripe/confirm-session", async (req, res) => {
+  try {
+    const { session_id } = req.query;
+
+    if (!session_id) {
+      return res.status(400).json({
+        success: false,
+        message: "session_id is required.",
+      });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+
+    if (session.payment_status !== "paid") {
+      return res.status(400).json({
+        success: false,
+        message: "Payment has not been completed.",
+      });
+    }
+
+    const { proposal_id, task_id, client_email, freelancer_email } =
+      session.metadata;
+
+    // Check if already processed (idempotency)
+    const existingPayment = await paymentsCollection.findOne({
+      transaction_id: session.payment_intent,
+    });
+
+    if (existingPayment) {
+      // Already processed — just return the summary
+      const task = await tasksCollection.findOne({
+        _id: new ObjectId(task_id),
+      });
+      const freelancer = await usersCollection.findOne({
+        email: freelancer_email,
+      });
+
+      return res.status(200).json({
+        success: true,
+        alreadyProcessed: true,
+        summary: {
+          taskTitle: task?.title || "Task",
+          freelancerName: freelancer?.name || "Freelancer",
+          amount: session.amount_total / 100,
+        },
+      });
+    }
+
+    // Mark accepted proposal
+    await proposalsCollection.updateOne(
+      { _id: new ObjectId(proposal_id) },
+      { $set: { status: "accepted" } },
+    );
+
+    // Reject all other proposals for this task
+    await proposalsCollection.updateMany(
+      {
+        task_id,
+        _id: { $ne: new ObjectId(proposal_id) },
+      },
+      { $set: { status: "rejected" } },
+    );
+
+    // Update task to in-progress
+    await tasksCollection.updateOne(
+      { _id: new ObjectId(task_id) },
+      { $set: { status: "in-progress" } },
+    );
+
+    // Insert payment record
+    await paymentsCollection.insertOne({
+      client_email,
+      freelancer_email,
+      task_id,
+      amount: session.amount_total / 100,
+      transaction_id: session.payment_intent,
+      payment_status: "succeeded",
+      paid_at: new Date(),
+    });
+
+    const task = await tasksCollection.findOne({
+      _id: new ObjectId(task_id),
+    });
+    const freelancer = await usersCollection.findOne({
+      email: freelancer_email,
+    });
+
+    res.status(200).json({
+      success: true,
+      summary: {
+        taskTitle: task?.title || "Task",
+        freelancerName: freelancer?.name || "Freelancer",
+        amount: session.amount_total / 100,
+      },
+    });
+  } catch (error) {
+    console.error("GET /api/stripe/confirm-session error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to confirm payment.",
+    });
+  }
+});
+
+// GET /api/payments/client — payment history for a client
+app.get("/api/payments/client", async (req, res) => {
+  try {
+    const { client_email } = req.query;
+
+    if (!client_email) {
+      return res.status(400).json({
+        success: false,
+        message: "client_email is required.",
+      });
+    }
+
+    const payments = await paymentsCollection
+      .aggregate([
+        { $match: { client_email, payment_status: "succeeded" } },
+        { $sort: { paid_at: -1 } },
+        {
+          $lookup: {
+            from: "tasks",
+            let: { taskIdStr: "$task_id" },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $eq: [{ $toString: "$_id" }, "$$taskIdStr"],
+                  },
+                },
+              },
+            ],
+            as: "taskInfo",
+          },
+        },
+        {
+          $lookup: {
+            from: "users",
+            localField: "freelancer_email",
+            foreignField: "email",
+            as: "freelancerInfo",
+          },
+        },
+        {
+          $addFields: {
+            task_title: {
+              $ifNull: [
+                { $arrayElemAt: ["$taskInfo.title", 0] },
+                "Deleted Task",
+              ],
+            },
+            freelancer_name: {
+              $ifNull: [
+                { $arrayElemAt: ["$freelancerInfo.name", 0] },
+                "Unknown Freelancer",
+              ],
+            },
+          },
+        },
+        { $project: { taskInfo: 0, freelancerInfo: 0 } },
+      ])
+      .toArray();
+
+    res.status(200).json({ success: true, payments });
+  } catch (error) {
+    console.error("GET /api/payments/client error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch payment history.",
     });
   }
 });
