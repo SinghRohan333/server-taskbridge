@@ -326,14 +326,7 @@ app.get(
   requireRole(["client"]),
   async (req, res) => {
     try {
-      const { client_email } = req.query;
-
-      if (!client_email) {
-        return res.status(400).json({
-          success: false,
-          message: "client_email is required.",
-        });
-      }
+      const client_email = req.user.email;
 
       const [totalTasks, openTasks, inProgressTasks, spentResult] =
         await Promise.all([
@@ -345,15 +338,8 @@ app.get(
           }),
           paymentsCollection
             .aggregate([
-              {
-                $match: {
-                  client_email,
-                  payment_status: "succeeded",
-                },
-              },
-              {
-                $group: { _id: null, total: { $sum: "$amount" } },
-              },
+              { $match: { client_email, payment_status: "succeeded" } },
+              { $group: { _id: null, total: { $sum: "$amount" } } },
             ])
             .toArray(),
         ]);
@@ -362,12 +348,7 @@ app.get(
 
       res.status(200).json({
         success: true,
-        stats: {
-          totalTasks,
-          openTasks,
-          inProgressTasks,
-          totalSpent,
-        },
+        stats: { totalTasks, openTasks, inProgressTasks, totalSpent },
       });
     } catch (error) {
       console.error("GET /api/tasks/client-stats error:", error);
@@ -385,14 +366,7 @@ app.get(
   requireRole(["client"]),
   async (req, res) => {
     try {
-      const { client_email } = req.query;
-
-      if (!client_email) {
-        return res.status(400).json({
-          success: false,
-          message: "client_email is required.",
-        });
-      }
+      const client_email = req.user.email;
 
       const tasks = await tasksCollection
         .aggregate([
@@ -441,14 +415,7 @@ app.get(
   requireRole(["freelancer"]),
   async (req, res) => {
     try {
-      const { freelancer_email } = req.query;
-
-      if (!freelancer_email) {
-        return res.status(400).json({
-          success: false,
-          message: "freelancer_email is required.",
-        });
-      }
+      const freelancer_email = req.user.email;
 
       const acceptedProposals = await proposalsCollection
         .find({ freelancer_email, status: "accepted" })
@@ -526,8 +493,8 @@ app.patch(
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { client_email, title, category, description, budget, deadline } =
-        req.body;
+      const client_email = req.user.email;
+      const { title, category, description, budget, deadline } = req.body;
 
       if (!ObjectId.isValid(id)) {
         return res.status(400).json({
@@ -594,7 +561,7 @@ app.delete(
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { client_email } = req.body;
+      const client_email = req.user.email;
 
       if (!ObjectId.isValid(id)) {
         return res.status(400).json({
@@ -831,21 +798,10 @@ app.post(
   requireRole(["freelancer"]),
   async (req, res) => {
     try {
-      const {
-        task_id,
-        freelancer_email,
-        proposed_budget,
-        estimated_days,
-        cover_note,
-      } = req.body;
+      const freelancer_email = req.user.email;
+      const { task_id, proposed_budget, estimated_days, cover_note } = req.body;
 
-      if (
-        !task_id ||
-        !freelancer_email ||
-        !proposed_budget ||
-        !estimated_days ||
-        !cover_note
-      ) {
+      if (!task_id || !proposed_budget || !estimated_days || !cover_note) {
         return res.status(400).json({
           success: false,
           message: "All fields are required.",
@@ -975,17 +931,10 @@ app.get("/api/reviews", async (req, res) => {
 
 app.post("/api/tasks", verifyJWT, requireRole(["client"]), async (req, res) => {
   try {
-    const { title, category, description, budget, deadline, client_email } =
-      req.body;
+    const client_email = req.user.email;
+    const { title, category, description, budget, deadline } = req.body;
 
-    if (
-      !title ||
-      !category ||
-      !description ||
-      !budget ||
-      !deadline ||
-      !client_email
-    ) {
+    if (!title || !category || !description || !budget || !deadline) {
       return res.status(400).json({
         success: false,
         message: "All fields are required.",
@@ -1041,14 +990,7 @@ app.get(
   requireRole(["client"]),
   async (req, res) => {
     try {
-      const { client_email } = req.query;
-
-      if (!client_email) {
-        return res.status(400).json({
-          success: false,
-          message: "client_email is required.",
-        });
-      }
+      const client_email = req.user.email;
 
       const clientTasks = await tasksCollection
         .find({ client_email })
@@ -1127,12 +1069,13 @@ app.post(
   requireRole(["client"]),
   async (req, res) => {
     try {
-      const { proposal_id, task_id, client_email } = req.body;
+      const client_email = req.user.email;
+      const { proposal_id, task_id } = req.body;
 
-      if (!proposal_id || !task_id || !client_email) {
+      if (!proposal_id || !task_id) {
         return res.status(400).json({
           success: false,
-          message: "proposal_id, task_id, and client_email are required.",
+          message: "proposal_id and task_id are required.",
         });
       }
 
@@ -1202,14 +1145,7 @@ app.get(
   requireRole(["client"]),
   async (req, res) => {
     try {
-      const { client_email } = req.query;
-
-      if (!client_email) {
-        return res.status(400).json({
-          success: false,
-          message: "client_email is required.",
-        });
-      }
+      const client_email = req.user.email;
 
       const payments = await paymentsCollection
         .aggregate([
@@ -1222,9 +1158,7 @@ app.get(
               pipeline: [
                 {
                   $match: {
-                    $expr: {
-                      $eq: [{ $toString: "$_id" }, "$$taskIdStr"],
-                    },
+                    $expr: { $eq: [{ $toString: "$_id" }, "$$taskIdStr"] },
                   },
                 },
               ],
@@ -1276,14 +1210,7 @@ app.get(
   requireRole(["freelancer"]),
   async (req, res) => {
     try {
-      const { freelancer_email } = req.query;
-
-      if (!freelancer_email) {
-        return res.status(400).json({
-          success: false,
-          message: "freelancer_email is required.",
-        });
-      }
+      const freelancer_email = req.user.email;
 
       const [total, pending, accepted, rejected, earningsResult] =
         await Promise.all([
@@ -1330,14 +1257,7 @@ app.get(
   requireRole(["freelancer"]),
   async (req, res) => {
     try {
-      const { freelancer_email } = req.query;
-
-      if (!freelancer_email) {
-        return res.status(400).json({
-          success: false,
-          message: "freelancer_email is required.",
-        });
-      }
+      const freelancer_email = req.user.email;
 
       const proposals = await proposalsCollection
         .aggregate([
@@ -1391,7 +1311,8 @@ app.patch(
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { freelancer_email, deliverable_url } = req.body;
+      const freelancer_email = req.user.email;
+      const { deliverable_url } = req.body;
 
       if (!ObjectId.isValid(id)) {
         return res
@@ -1446,14 +1367,7 @@ app.get(
   requireRole(["freelancer"]),
   async (req, res) => {
     try {
-      const { freelancer_email } = req.query;
-
-      if (!freelancer_email) {
-        return res.status(400).json({
-          success: false,
-          message: "freelancer_email is required.",
-        });
-      }
+      const freelancer_email = req.user.email;
 
       const payments = await paymentsCollection
         .aggregate([
@@ -1518,12 +1432,13 @@ app.get(
   requireRole(["freelancer"]),
   async (req, res) => {
     try {
-      const { task_id, reviewer_email } = req.query;
+      const reviewer_email = req.user.email;
+      const { task_id } = req.query;
 
-      if (!task_id || !reviewer_email) {
+      if (!task_id) {
         return res.status(400).json({
           success: false,
-          message: "task_id and reviewer_email are required.",
+          message: "task_id is required.",
         });
       }
 
@@ -1543,7 +1458,8 @@ app.get(
 
 app.patch("/api/users/me", verifyJWT, async (req, res) => {
   try {
-    const { email, name, image, skills, bio, hourlyRate } = req.body;
+    const email = req.user.email;
+    const { name, image, skills, bio, hourlyRate } = req.body;
 
     if (!email) {
       return res
@@ -2158,10 +2074,10 @@ app.get("/api/stripe/confirm-session", async (req, res) => {
 
 async function createReview(req, res) {
   try {
-    const { task_id, reviewer_email, reviewee_email, rating, comment } =
-      req.body;
+    const reviewer_email = req.user.email;
+    const { task_id, reviewee_email, rating, comment } = req.body;
 
-    if (!task_id || !reviewer_email || !reviewee_email || !rating) {
+    if (!task_id || !reviewee_email || !rating) {
       return res
         .status(400)
         .json({ success: false, message: "All fields are required." });
