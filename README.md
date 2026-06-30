@@ -12,10 +12,10 @@ The REST API powering [TaskBridge](#links) — a freelance micro-task marketplac
 
 ## Links
 
-|                        |                                                                                           |
-| ---------------------- | ----------------------------------------------------------------------------------------- |
-| 🔗 Live API            | [your-deployed-link.vercel.app](https://server-taskbridge.vercel.app/)                    |
-| 🖥️ Frontend Repository | [github.com/your-username/taskbridge-client](https://github.com/SinghRohan333/TaskBridge) |
+|                        |                                                                                    |
+| ---------------------- | ---------------------------------------------------------------------------------- |
+| 🔗 Live API            | [server-taskbridge.vercel.app](https://server-taskbridge.vercel.app)               |
+| 🖥️ Frontend Repository | [github.com/SinghRohan333/TaskBridge](https://github.com/SinghRohan333/TaskBridge) |
 
 ---
 
